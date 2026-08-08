@@ -17,7 +17,9 @@ fn pair_request_roundtrips() {
 
 #[test]
 fn pair_confirm_roundtrips() {
-    let msg = Message::PairConfirm { code: "482913".into() };
+    let msg = Message::PairConfirm {
+        code: "482913".into(),
+    };
     assert_eq!(roundtrip(&msg), msg);
 }
 
@@ -57,7 +59,9 @@ fn job_request_roundtrips_with_optional_fields_absent() {
 
 #[test]
 fn job_cancel_roundtrips() {
-    let msg = Message::JobCancel { job_id: "job-1".into() };
+    let msg = Message::JobCancel {
+        job_id: "job-1".into(),
+    };
     assert_eq!(roundtrip(&msg), msg);
 }
 
@@ -156,7 +160,9 @@ fn error_roundtrips() {
 
 #[test]
 fn tag_field_is_the_variant_name() {
-    let msg = Message::JobCancel { job_id: "job-9".into() };
+    let msg = Message::JobCancel {
+        job_id: "job-9".into(),
+    };
     let value: serde_json::Value = serde_json::to_value(&msg).expect("to_value");
     assert_eq!(value["type"], "JobCancel");
 }
