@@ -1,0 +1,20 @@
+# Rust
+/target
+**/target
+
+# Node
+node_modules
+apps/desktop/dist
+
+# Tauri
+apps/desktop/src-tauri/target
+
+# Runtime data (see spec: ~/Documents/DistBuild is outside the repo, this
+# only covers anything accidentally created inside the repo during dev)
+/DistBuild-dev/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/*
+!.vscode/extensions.json
