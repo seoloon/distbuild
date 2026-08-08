@@ -66,11 +66,34 @@ pub fn load_or_generate_cert(cert_dir: &Path) -> Result<CertPems, TlsError> {
         path: key_path.clone(),
         source,
     })?;
+    restrict_to_owner(&key_path).map_err(|source| TlsError::Write {
+        path: key_path.clone(),
+        source,
+    })?;
 
     Ok(CertPems {
         cert_pem: cert_pem.into_bytes(),
         key_pem: key_pem.into_bytes(),
     })
+}
+
+/// Restricts a freshly-written private key file to owner-only access.
+/// `std::fs::write` leaves new files at the process's default (umask-based)
+/// permissions, which on Unix is typically world-readable — unacceptable
+/// for a TLS private key.
+#[cfg(unix)]
+fn restrict_to_owner(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+}
+
+/// On Windows, NTFS ACLs already scope a user's `Documents` folder to that
+/// user (and administrators) by default, so no extra restriction is
+/// applied here. Locking this down further would need an explicit ACL
+/// (e.g. via the `windows-acl` crate), which is out of scope for now.
+#[cfg(not(unix))]
+fn restrict_to_owner(_path: &Path) -> std::io::Result<()> {
+    Ok(())
 }
 
 #[cfg(test)]
@@ -94,5 +117,20 @@ mod tests {
         let second = load_or_generate_cert(dir.path()).expect("second load_or_generate_cert");
 
         assert_eq!(first, second);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_key_is_restricted_to_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        load_or_generate_cert(dir.path()).expect("load_or_generate_cert");
+
+        let mode = std::fs::metadata(dir.path().join("key.pem"))
+            .expect("metadata")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
     }
 }
