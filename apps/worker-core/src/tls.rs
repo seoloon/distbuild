@@ -62,11 +62,7 @@ pub fn load_or_generate_cert(cert_dir: &Path) -> Result<CertPems, TlsError> {
         path: cert_path.clone(),
         source,
     })?;
-    std::fs::write(&key_path, &key_pem).map_err(|source| TlsError::Write {
-        path: key_path.clone(),
-        source,
-    })?;
-    restrict_to_owner(&key_path).map_err(|source| TlsError::Write {
+    write_private_key(&key_path, &key_pem).map_err(|source| TlsError::Write {
         path: key_path.clone(),
         source,
     })?;
@@ -77,14 +73,24 @@ pub fn load_or_generate_cert(cert_dir: &Path) -> Result<CertPems, TlsError> {
     })
 }
 
-/// Restricts a freshly-written private key file to owner-only access.
-/// `std::fs::write` leaves new files at the process's default (umask-based)
-/// permissions, which on Unix is typically world-readable — unacceptable
-/// for a TLS private key.
+/// Writes a freshly-generated private key with owner-only permissions set
+/// *at creation time*, rather than writing the file and `chmod`-ing it
+/// afterward. A write-then-chmod sequence leaves a TOCTOU window where the
+/// key sits at the process's default (umask-based) permissions — typically
+/// world-readable on Unix — before the restriction lands; opening with the
+/// mode already specified closes that window entirely.
 #[cfg(unix)]
-fn restrict_to_owner(path: &Path) -> std::io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+fn write_private_key(path: &Path, key_pem: &str) -> std::io::Result<()> {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)?;
+    file.write_all(key_pem.as_bytes())
 }
 
 /// On Windows, NTFS ACLs already scope a user's `Documents` folder to that
@@ -92,8 +98,8 @@ fn restrict_to_owner(path: &Path) -> std::io::Result<()> {
 /// applied here. Locking this down further would need an explicit ACL
 /// (e.g. via the `windows-acl` crate), which is out of scope for now.
 #[cfg(not(unix))]
-fn restrict_to_owner(_path: &Path) -> std::io::Result<()> {
-    Ok(())
+fn write_private_key(path: &Path, key_pem: &str) -> std::io::Result<()> {
+    std::fs::write(path, key_pem)
 }
 
 #[cfg(test)]
