@@ -1,3 +1,4 @@
+pub mod jobs;
 mod net;
 mod pairing;
 mod server;

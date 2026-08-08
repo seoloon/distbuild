@@ -32,6 +32,9 @@ async fn spawn_test_server() -> SocketAddr {
         os: "linux".to_string(),
         arch: "x86_64".to_string(),
         peer_store: Arc::new(Mutex::new(peer_store)),
+        runtime_dir: std::env::temp_dir()
+            .join(format!("distbuild-test-runtime-{}", std::process::id())),
+        jobs: Arc::new(Mutex::new(std::collections::HashMap::new())),
     };
 
     let app = worker_core::build_router(state);

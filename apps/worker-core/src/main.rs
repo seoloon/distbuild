@@ -44,6 +44,8 @@ async fn main() {
         os: std::env::consts::OS.to_string(),
         arch: std::env::consts::ARCH.to_string(),
         peer_store: Arc::new(Mutex::new(peer_store)),
+        runtime_dir: runtime_dir.clone(),
+        jobs: Arc::new(Mutex::new(std::collections::HashMap::new())),
     };
 
     tracing::info!(
