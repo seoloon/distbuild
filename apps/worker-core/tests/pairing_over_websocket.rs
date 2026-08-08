@@ -138,6 +138,62 @@ async fn wrong_code_over_a_real_websocket_connection_is_rejected() {
     }
 }
 
+#[tokio::test]
+async fn repeated_wrong_codes_lock_and_close_the_connection() {
+    let addr = spawn_test_server().await;
+    let url = format!("ws://{addr}/ws");
+
+    let (mut ws, _response) = tokio_tungstenite::connect_async(url)
+        .await
+        .expect("connect");
+
+    // worker_core::pairing::MAX_PAIRING_ATTEMPTS is private to the crate;
+    // 5 is duplicated here deliberately so this test breaks loudly (rather
+    // than silently under-testing) if that constant ever changes.
+    const MAX_ATTEMPTS: usize = 5;
+
+    for attempt in 1..=MAX_ATTEMPTS {
+        let pair_request = Message::PairRequest {
+            master_name: "MacBook-Pro".to_string(),
+            master_id: "master-lockout-test".to_string(),
+        };
+        ws.send(WsMessage::Text(
+            serde_json::to_string(&pair_request).unwrap().into(),
+        ))
+        .await
+        .expect("send PairRequest");
+        next_message(&mut ws).await; // PairChallenge, code discarded on purpose
+
+        let confirm = Message::PairConfirm {
+            code: "000000".to_string(),
+        };
+        ws.send(WsMessage::Text(
+            serde_json::to_string(&confirm).unwrap().into(),
+        ))
+        .await
+        .expect("send PairConfirm");
+
+        let reply = next_message(&mut ws).await;
+        let expected_code = if attempt < MAX_ATTEMPTS {
+            "PAIRING_FAILED"
+        } else {
+            "TOO_MANY_ATTEMPTS"
+        };
+        match reply {
+            Message::Error { code, .. } => assert_eq!(code, expected_code),
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    // The server should have closed the connection after locking.
+    let next = ws.next().await;
+    match next {
+        None => {}
+        Some(Ok(WsMessage::Close(_))) => {}
+        other => panic!("expected the connection to be closed, got {other:?}"),
+    }
+}
+
 async fn next_message(
     ws: &mut tokio_tungstenite::WebSocketStream<
         tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,

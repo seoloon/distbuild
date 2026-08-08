@@ -104,11 +104,18 @@ impl PeerStore {
     }
 }
 
+/// After this many failed `PairConfirm` attempts on a single connection,
+/// the session locks permanently and the connection must be dropped and
+/// re-established to try again — bounding brute-force guessing of the
+/// 6-digit code to a handful of attempts per TCP/WS handshake.
+const MAX_PAIRING_ATTEMPTS: u8 = 5;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PairingStatus {
     AwaitingRequest,
     AwaitingConfirm,
     Paired,
+    Locked,
 }
 
 /// Drives one connection's challenge/confirm pairing flow, per
@@ -122,6 +129,7 @@ pub struct PairingSession {
     status: PairingStatus,
     expected_code: Option<String>,
     pending_master: Option<(String, String)>,
+    failed_attempts: u8,
 }
 
 impl PairingSession {
@@ -139,11 +147,19 @@ impl PairingSession {
             status: PairingStatus::AwaitingRequest,
             expected_code: None,
             pending_master: None,
+            failed_attempts: 0,
         }
     }
 
     pub fn is_paired(&self) -> bool {
         self.status == PairingStatus::Paired
+    }
+
+    /// True once too many wrong codes have been submitted on this
+    /// connection. The caller (the `/ws` handler) should send the final
+    /// reply and then close the socket rather than keep reading.
+    pub fn is_locked(&self) -> bool {
+        self.status == PairingStatus::Locked
     }
 
     /// Handles one incoming [`Message`], returning the reply to send back
@@ -159,10 +175,13 @@ impl PairingSession {
                 },
             ) => {
                 let code = generate_code();
+                // Deliberately not logged: the code is a shared secret meant
+                // to travel only through the PairChallenge reply (for the
+                // caller to display locally) and the human's own eyes — not
+                // through log aggregation.
                 tracing::info!(
-                    code = %code,
                     master_name = %master_name,
-                    "pairing code generated — enter this on the Master"
+                    "pairing requested — a pairing code has been generated for display on the worker"
                 );
                 self.pending_master = Some((master_id.clone(), master_name.clone()));
                 self.expected_code = Some(code.clone());
@@ -176,9 +195,6 @@ impl PairingSession {
             }
             (PairingStatus::AwaitingConfirm, Message::PairConfirm { code }) => {
                 let expected = self.expected_code.take();
-                // One confirm attempt per pairing round: a fresh PairRequest
-                // is required to retry, which bounds brute-force guessing.
-                self.status = PairingStatus::AwaitingRequest;
                 if expected.as_deref() == Some(code.trim()) {
                     self.status = PairingStatus::Paired;
                     let (master_id, master_name) = self
@@ -199,19 +215,43 @@ impl PairingSession {
                         Some(peer),
                     )
                 } else {
-                    (
-                        Some(Message::Error {
-                            code: "PAIRING_FAILED".to_string(),
-                            message: "pairing code did not match".to_string(),
-                        }),
-                        None,
-                    )
+                    self.failed_attempts += 1;
+                    if self.failed_attempts >= MAX_PAIRING_ATTEMPTS {
+                        self.status = PairingStatus::Locked;
+                        (
+                            Some(Message::Error {
+                                code: "TOO_MANY_ATTEMPTS".to_string(),
+                                message: "too many failed pairing attempts; reconnect to try again"
+                                    .to_string(),
+                            }),
+                            None,
+                        )
+                    } else {
+                        // A fresh PairRequest (and thus a fresh code) is
+                        // required to retry — the stale confirm no longer
+                        // matches anything.
+                        self.status = PairingStatus::AwaitingRequest;
+                        (
+                            Some(Message::Error {
+                                code: "PAIRING_FAILED".to_string(),
+                                message: "pairing code did not match".to_string(),
+                            }),
+                            None,
+                        )
+                    }
                 }
             }
             (PairingStatus::Paired, _) => (
                 Some(Message::Error {
                     code: "ALREADY_PAIRED".to_string(),
                     message: "this connection is already paired".to_string(),
+                }),
+                None,
+            ),
+            (PairingStatus::Locked, _) => (
+                Some(Message::Error {
+                    code: "TOO_MANY_ATTEMPTS".to_string(),
+                    message: "too many failed pairing attempts; reconnect to try again".to_string(),
                 }),
                 None,
             ),
@@ -299,6 +339,40 @@ mod tests {
         });
         match reply {
             Some(Message::Error { code, .. }) => assert_eq!(code, "UNEXPECTED_MESSAGE"),
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn locks_after_max_failed_attempts_and_rejects_everything_afterward() {
+        let mut session = PairingSession::new("worker-1", "Threadripper-Box", "linux", "x86_64");
+
+        for attempt in 1..=MAX_PAIRING_ATTEMPTS {
+            session.handle(&pair_request());
+            let (reply, peer) = session.handle(&Message::PairConfirm {
+                code: "000000".to_string(),
+            });
+            assert!(peer.is_none());
+            if attempt < MAX_PAIRING_ATTEMPTS {
+                assert!(!session.is_locked(), "should not lock before the limit");
+                match reply {
+                    Some(Message::Error { code, .. }) => assert_eq!(code, "PAIRING_FAILED"),
+                    other => panic!("expected Error, got {other:?}"),
+                }
+            } else {
+                assert!(session.is_locked(), "should lock at the limit");
+                match reply {
+                    Some(Message::Error { code, .. }) => assert_eq!(code, "TOO_MANY_ATTEMPTS"),
+                    other => panic!("expected Error, got {other:?}"),
+                }
+            }
+        }
+
+        // Once locked, even a well-formed, freshly-requested pairing is refused.
+        let (reply, peer) = session.handle(&pair_request());
+        assert!(peer.is_none());
+        match reply {
+            Some(Message::Error { code, .. }) => assert_eq!(code, "TOO_MANY_ATTEMPTS"),
             other => panic!("expected Error, got {other:?}"),
         }
     }

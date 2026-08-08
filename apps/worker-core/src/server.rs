@@ -81,5 +81,11 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
                 break;
             }
         }
+
+        if session.is_locked() {
+            tracing::warn!("too many failed pairing attempts on this connection; closing it");
+            let _ = socket.send(WsMessage::Close(None)).await;
+            break;
+        }
     }
 }
