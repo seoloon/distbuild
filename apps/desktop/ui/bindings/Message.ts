@@ -7,4 +7,21 @@ import type { LogStream } from "./LogStream";
  * DistBuild WebSocket protocol. Tagged with a `"type"` field so both
  * sides can dispatch on a single discriminant.
  */
-export type Message = { "type": "PairRequest", master_name: string, master_id: string, } | { "type": "PairConfirm", code: string, } | { "type": "JobRequest", job_id: string, repo: string, branch: string, profile: string, env?: { [key in string]: string } | null, distbuild_toml?: string | null, } | { "type": "JobCancel", job_id: string, } | { "type": "PairChallenge", code_shown_on_worker: string, } | { "type": "PairAccepted", worker_id: string, worker_name: string, os: string, arch: string, } | { "type": "JobStarted", job_id: string, timestamp: string, } | { "type": "LogChunk", job_id: string, stream: LogStream, data: string, ts: bigint, } | { "type": "JobProgress", job_id: string, phase: JobPhase, pct?: number | null, } | { "type": "JobFinished", job_id: string, success: boolean, duration_ms: bigint, exit_code: number | null, } | { "type": "ArtifactReady", job_id: string, filename: string, size_bytes: bigint, sha256: string, } | { "type": "Error", code: string, message: string, };
+export type Message = { "type": "PairRequest", master_name: string, master_id: string, 
+/**
+ * Present when the Master believes it was already paired with
+ * this worker and is reconnecting, not pairing for the first
+ * time. Must match the token the worker handed back in that
+ * prior pairing's `PairAccepted` for the worker to skip the
+ * human-confirmed code — `master_id` alone is a bare,
+ * non-secret identifier and must never be trusted as proof of
+ * identity on its own.
+ */
+reconnect_token?: string | null, } | { "type": "PairConfirm", code: string, } | { "type": "JobRequest", job_id: string, repo: string, branch: string, profile: string, env?: { [key in string]: string } | null, distbuild_toml?: string | null, } | { "type": "JobCancel", job_id: string, } | { "type": "PairChallenge", code_shown_on_worker: string, } | { "type": "PairAccepted", worker_id: string, worker_name: string, os: string, arch: string, 
+/**
+ * A fresh, single-use secret the Master must present (as
+ * `PairRequest.reconnect_token`) to silently re-pair on its next
+ * connection instead of repeating the human-confirmed code.
+ * Rotated on every successful pairing, including reconnects.
+ */
+reconnect_token: string, } | { "type": "JobStarted", job_id: string, timestamp: string, } | { "type": "LogChunk", job_id: string, stream: LogStream, data: string, ts: bigint, } | { "type": "JobProgress", job_id: string, phase: JobPhase, pct?: number | null, } | { "type": "JobFinished", job_id: string, success: boolean, duration_ms: bigint, exit_code: number | null, } | { "type": "ArtifactReady", job_id: string, filename: string, size_bytes: bigint, sha256: string, } | { "type": "Error", code: string, message: string, };

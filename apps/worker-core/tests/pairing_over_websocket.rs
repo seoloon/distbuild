@@ -65,6 +65,7 @@ async fn full_pairing_flow_over_a_real_websocket_connection() {
     let pair_request = Message::PairRequest {
         master_name: "MacBook-Pro".to_string(),
         master_id: "master-e2e-test".to_string(),
+        reconnect_token: None,
     };
     ws.send(WsMessage::Text(
         serde_json::to_string(&pair_request).unwrap().into(),
@@ -89,19 +90,77 @@ async fn full_pairing_flow_over_a_real_websocket_connection() {
     .expect("send PairConfirm");
 
     let accepted = next_message(&mut ws).await;
-    match accepted {
+    let reconnect_token = match accepted {
         Message::PairAccepted {
             worker_id,
             worker_name,
             os,
             arch,
+            reconnect_token,
         } => {
             assert_eq!(worker_id, "worker-test-1");
             assert_eq!(worker_name, "Test-Worker");
             assert_eq!(os, "linux");
             assert_eq!(arch, "x86_64");
+            assert_eq!(reconnect_token.len(), 64);
+            reconnect_token
         }
         other => panic!("expected PairAccepted, got {other:?}"),
+    };
+
+    // A fresh connection presenting the reconnect token issued above
+    // should be silently re-paired, with no PairChallenge round-trip.
+    let url = format!("ws://{addr}/ws");
+    let (mut second_ws, _response) = tokio_tungstenite::connect_async(url)
+        .await
+        .expect("connect");
+    second_ws
+        .send(WsMessage::Text(
+            serde_json::to_string(&Message::PairRequest {
+                master_name: "MacBook-Pro".to_string(),
+                master_id: "master-e2e-test".to_string(),
+                reconnect_token: Some(reconnect_token),
+            })
+            .unwrap()
+            .into(),
+        ))
+        .await
+        .expect("send PairRequest with reconnect_token");
+    match next_message(&mut second_ws).await {
+        Message::PairAccepted { .. } => {}
+        other => panic!("expected silent PairAccepted, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_reconnect_with_the_wrong_token_falls_back_to_the_normal_challenge() {
+    let addr = spawn_test_server().await;
+    let url = format!("ws://{addr}/ws");
+
+    let (mut ws, _response) = tokio_tungstenite::connect_async(url)
+        .await
+        .expect("connect");
+
+    // No prior pairing exists for this master_id, so a forged/guessed
+    // token must never grant access — it should fall back to the normal
+    // human-confirmed-code flow rather than an error or a bypass.
+    ws.send(WsMessage::Text(
+        serde_json::to_string(&Message::PairRequest {
+            master_name: "Attacker".to_string(),
+            master_id: "master-never-paired".to_string(),
+            reconnect_token: Some("f".repeat(64)),
+        })
+        .unwrap()
+        .into(),
+    ))
+    .await
+    .expect("send PairRequest");
+
+    match next_message(&mut ws).await {
+        Message::PairChallenge {
+            code_shown_on_worker,
+        } => assert_eq!(code_shown_on_worker.len(), 6),
+        other => panic!("expected a normal PairChallenge fallback, got {other:?}"),
     }
 }
 
@@ -117,6 +176,7 @@ async fn wrong_code_over_a_real_websocket_connection_is_rejected() {
     let pair_request = Message::PairRequest {
         master_name: "MacBook-Pro".to_string(),
         master_id: "master-e2e-test-2".to_string(),
+        reconnect_token: None,
     };
     ws.send(WsMessage::Text(
         serde_json::to_string(&pair_request).unwrap().into(),
@@ -159,6 +219,7 @@ async fn repeated_wrong_codes_lock_and_close_the_connection() {
         let pair_request = Message::PairRequest {
             master_name: "MacBook-Pro".to_string(),
             master_id: "master-lockout-test".to_string(),
+            reconnect_token: None,
         };
         ws.send(WsMessage::Text(
             serde_json::to_string(&pair_request).unwrap().into(),

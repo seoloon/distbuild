@@ -83,6 +83,7 @@ async fn a_pinned_reconnect_to_a_different_certificate_is_rejected() {
         host: addr.ip().to_string(),
         port: addr.port(),
         fingerprint: [0u8; 32],
+        reconnect_token: "a".repeat(64),
     };
 
     let result = desktop_lib::ws_client::connect_paired(&wrong_peer).await;

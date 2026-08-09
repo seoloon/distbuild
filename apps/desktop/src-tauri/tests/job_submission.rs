@@ -112,13 +112,18 @@ async fn submits_a_job_over_a_pinned_connection_and_writes_the_reassembled_artif
     peer.host = host;
     peer.port = port;
 
-    let stream = desktop_lib::ws_client::resume_paired_connection(
+    let (stream, rotated_token) = desktop_lib::ws_client::resume_paired_connection(
         &peer,
         "MacBook-Pro",
         "master-job-submit-test",
     )
     .await
     .expect("resume_paired_connection");
+    assert_eq!(rotated_token.len(), 64);
+    assert_ne!(
+        rotated_token, peer.reconnect_token,
+        "the token should rotate on each successful reconnect"
+    );
 
     struct NoopSink;
     impl desktop_lib::ws_client::JobEventSink for NoopSink {

@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -39,6 +39,11 @@ pub struct MasterPeer {
     pub port: u16,
     #[serde(with = "hex_fingerprint")]
     pub fingerprint: [u8; 32],
+    /// Current secret this Master presents on reconnect to skip the
+    /// human-confirmed code — see
+    /// `worker_core::pairing::PairingSession::accept_as_already_paired`.
+    /// Rotated every time it's used.
+    pub reconnect_token: String,
 }
 
 mod hex_fingerprint {
@@ -131,11 +136,35 @@ impl MasterPeerStore {
         };
         let json =
             serde_json::to_string_pretty(&file).expect("PeersFile serialization cannot fail");
-        fs::write(&self.path, json).map_err(|source| PeerStoreError::Write {
+        write_owner_only(&self.path, &json).map_err(|source| PeerStoreError::Write {
             path: self.path.clone(),
             source,
         })
     }
+}
+
+/// Writes `contents` with owner-only permissions set at creation time
+/// rather than written-then-chmod'd — this file holds reconnect tokens,
+/// which are bearer secrets. See `worker_core::pairing`'s identical
+/// pattern (applied there for the same reason) and Phase 2's TLS
+/// private-key fix this mirrors.
+#[cfg(unix)]
+fn write_owner_only(path: &Path, contents: &str) -> std::io::Result<()> {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)?;
+    file.write_all(contents.as_bytes())
+}
+
+#[cfg(not(unix))]
+fn write_owner_only(path: &Path, contents: &str) -> std::io::Result<()> {
+    std::fs::write(path, contents)
 }
 
 #[cfg(test)]
@@ -158,6 +187,7 @@ mod tests {
                 host: "192.168.1.42".to_string(),
                 port: 7878,
                 fingerprint,
+                reconnect_token: "a".repeat(64),
             })
             .expect("add_and_save");
 
@@ -165,5 +195,32 @@ mod tests {
         let peer = reloaded.get("worker-1").expect("peer present");
         assert_eq!(peer.fingerprint, fingerprint);
         assert_eq!(peer.host, "192.168.1.42");
+        assert_eq!(peer.reconnect_token, "a".repeat(64));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn peers_file_is_restricted_to_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("peers-master.json");
+        let mut store = MasterPeerStore::load(&path).expect("load empty store");
+        store
+            .add_and_save(MasterPeer {
+                worker_id: "worker-1".to_string(),
+                worker_name: "Threadripper-Box".to_string(),
+                host: "192.168.1.42".to_string(),
+                port: 7878,
+                fingerprint: [7u8; 32],
+                reconnect_token: "a".repeat(64),
+            })
+            .expect("add_and_save");
+
+        let mode = std::fs::metadata(&path)
+            .expect("metadata")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
     }
 }

@@ -13,6 +13,15 @@ pub enum Message {
     PairRequest {
         master_name: String,
         master_id: String,
+        /// Present when the Master believes it was already paired with
+        /// this worker and is reconnecting, not pairing for the first
+        /// time. Must match the token the worker handed back in that
+        /// prior pairing's `PairAccepted` for the worker to skip the
+        /// human-confirmed code — `master_id` alone is a bare,
+        /// non-secret identifier and must never be trusted as proof of
+        /// identity on its own.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reconnect_token: Option<String>,
     },
     PairConfirm {
         code: String,
@@ -40,6 +49,11 @@ pub enum Message {
         worker_name: String,
         os: String,
         arch: String,
+        /// A fresh, single-use secret the Master must present (as
+        /// `PairRequest.reconnect_token`) to silently re-pair on its next
+        /// connection instead of repeating the human-confirmed code.
+        /// Rotated on every successful pairing, including reconnects.
+        reconnect_token: String,
     },
     JobStarted {
         job_id: String,

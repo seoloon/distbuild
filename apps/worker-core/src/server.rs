@@ -81,16 +81,30 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
                 };
 
                 if !session.is_paired() {
-                    if let protocol::Message::PairRequest { master_id, .. } = &incoming {
-                        let already_known = state.peer_store.lock().await.is_paired(master_id);
-                        if already_known {
-                            let reply = session.accept_as_already_paired();
-                            let json = serde_json::to_string(&reply)
-                                .expect("Message serialization cannot fail");
-                            if socket.send(WsMessage::Text(json.into())).await.is_err() {
-                                break;
+                    if let protocol::Message::PairRequest { master_id, reconnect_token: Some(token), .. } = &incoming {
+                        // master_id alone is a bare, non-secret identifier — only a
+                        // matching reconnect_token (a rotating bearer secret handed
+                        // out on the previous pairing) authorizes skipping the
+                        // human-confirmed code. Any mismatch or unknown master_id
+                        // falls through to the normal challenge/confirm flow below,
+                        // never to an error — a forged token just means "pair like normal".
+                        let known_peer = state.peer_store.lock().await.get(master_id).cloned();
+                        if let Some(peer) = known_peer {
+                            if peer.reconnect_token == *token {
+                                let (reply, rotated_peer) =
+                                    session.accept_as_already_paired(master_id, &peer.master_name);
+                                if let Err(error) =
+                                    state.peer_store.lock().await.add_and_save(rotated_peer)
+                                {
+                                    tracing::error!(%error, "failed to persist rotated reconnect token");
+                                }
+                                let json = serde_json::to_string(&reply)
+                                    .expect("Message serialization cannot fail");
+                                if socket.send(WsMessage::Text(json.into())).await.is_err() {
+                                    break;
+                                }
+                                continue;
                             }
-                            continue;
                         }
                     }
                 }

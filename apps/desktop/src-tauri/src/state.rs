@@ -62,6 +62,31 @@ fn load_or_generate_master_id(runtime_dir: &Path) -> String {
     }
     let id = format!("master-{:016x}", rand::random::<u64>());
     let _ = std::fs::create_dir_all(runtime_dir);
-    let _ = std::fs::write(&path, &id);
+    let _ = write_owner_only(&path, &id);
     id
+}
+
+/// Writes `contents` with owner-only permissions set at creation time
+/// rather than written-then-chmod'd. Mirrors the identical helper in
+/// `peers.rs` and `tls.rs` (worker-core) — this file is this Master's
+/// stable identity, worth the same protection as the other credential
+/// files even though, unlike `reconnect_token`, it isn't itself a bearer
+/// secret in the current design.
+#[cfg(unix)]
+fn write_owner_only(path: &Path, contents: &str) -> std::io::Result<()> {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)?;
+    file.write_all(contents.as_bytes())
+}
+
+#[cfg(not(unix))]
+fn write_owner_only(path: &Path, contents: &str) -> std::io::Result<()> {
+    std::fs::write(path, contents)
 }

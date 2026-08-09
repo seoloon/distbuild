@@ -115,6 +115,7 @@ async fn submits_a_real_job_and_receives_a_reassembled_artifact() {
         serde_json::to_string(&Message::PairRequest {
             master_name: "MacBook-Pro".to_string(),
             master_id: "master-job-test".to_string(),
+            reconnect_token: None,
         })
         .unwrap()
         .into(),

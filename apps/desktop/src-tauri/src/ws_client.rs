@@ -107,6 +107,7 @@ pub async fn begin_pairing(
         &Message::PairRequest {
             master_name: master_name.to_string(),
             master_id: master_id.to_string(),
+            reconnect_token: None,
         },
     )
     .await?;
@@ -144,6 +145,7 @@ pub async fn confirm_pairing(
         Message::PairAccepted {
             worker_id,
             worker_name,
+            reconnect_token,
             ..
         } => Ok(MasterPeer {
             worker_id,
@@ -151,6 +153,7 @@ pub async fn confirm_pairing(
             host: String::new(),
             port: 0,
             fingerprint: session.fingerprint,
+            reconnect_token,
         }),
         Message::Error { code, message } => Err(WsClientError::Rejected { code, message }),
         other => Err(WsClientError::UnexpectedReply(other)),
@@ -168,28 +171,36 @@ pub async fn connect_paired(peer: &MasterPeer) -> Result<WsStream, WsClientError
 /// Opens a pinned connection to an already-paired worker and completes
 /// the pairing handshake on it. Pairing state lives per-connection on the
 /// worker, not per-identity, so every new connection needs *a*
-/// `PairRequest` — but since the worker recognizes this `master_id` from
-/// a previous pairing, it accepts immediately without a fresh
-/// human-confirmed code (see `worker_core::pairing::PairingSession::accept_as_already_paired`).
-/// Returns a stream ready for `JobRequest`/`JobCancel`.
+/// `PairRequest` — but presenting `peer.reconnect_token` (a rotating
+/// bearer secret from the previous pairing, *not* the bare `master_id`,
+/// which is not a secret) lets the worker accept it immediately without a
+/// fresh human-confirmed code (see
+/// `worker_core::pairing::PairingSession::accept_as_already_paired`).
+///
+/// Returns the ready-to-use stream plus the freshly rotated token — the
+/// caller (`commands.rs`) must persist it to `MasterPeerStore`, since the
+/// one just used is now invalid for future reconnects.
 pub async fn resume_paired_connection(
     peer: &MasterPeer,
     master_name: &str,
     master_id: &str,
-) -> Result<WsStream, WsClientError> {
+) -> Result<(WsStream, String), WsClientError> {
     let mut stream = connect_paired(peer).await?;
     send(
         &mut stream,
         &Message::PairRequest {
             master_name: master_name.to_string(),
             master_id: master_id.to_string(),
+            reconnect_token: Some(peer.reconnect_token.clone()),
         },
     )
     .await?;
 
     let reply = recv_message(&mut stream).await?;
     match reply {
-        Message::PairAccepted { .. } => Ok(stream),
+        Message::PairAccepted {
+            reconnect_token, ..
+        } => Ok((stream, reconnect_token)),
         Message::Error { code, message } => Err(WsClientError::Rejected { code, message }),
         other => Err(WsClientError::UnexpectedReply(other)),
     }
@@ -321,11 +332,18 @@ pub async fn run_job_stream<S: JobEventSink>(
 
     if let Some(filename) = artifact_filename {
         if !chunks.is_empty() {
-            chunks.sort_by_key(|(index, _)| *index);
-            let reassembled: Vec<u8> = chunks.into_iter().flat_map(|(_, bytes)| bytes).collect();
-            let job_dir = artifacts_dir.join(&job_id);
-            if std::fs::create_dir_all(&job_dir).is_ok() {
-                let _ = std::fs::write(job_dir.join(&filename), &reassembled);
+            // `filename` came from the worker over the wire — never trust
+            // it as a path directly. Keep only its final path component so
+            // a malicious or buggy worker can't write outside `job_dir`
+            // via a `../`-laden filename.
+            if let Some(safe_name) = std::path::Path::new(&filename).file_name() {
+                chunks.sort_by_key(|(index, _)| *index);
+                let reassembled: Vec<u8> =
+                    chunks.into_iter().flat_map(|(_, bytes)| bytes).collect();
+                let job_dir = artifacts_dir.join(&job_id);
+                if std::fs::create_dir_all(&job_dir).is_ok() {
+                    let _ = std::fs::write(job_dir.join(safe_name), &reassembled);
+                }
             }
         }
     }

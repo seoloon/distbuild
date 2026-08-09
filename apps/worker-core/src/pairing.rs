@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use protocol::Message;
 use serde::{Deserialize, Serialize};
@@ -33,6 +33,11 @@ pub enum PeerStoreError {
 pub struct Peer {
     pub master_id: String,
     pub master_name: String,
+    /// Current secret this Master must present on `PairRequest` to
+    /// silently re-pair without repeating the human-confirmed code.
+    /// Rotated every time it's used — see
+    /// [`PairingSession::accept_as_already_paired`].
+    pub reconnect_token: String,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -80,6 +85,10 @@ impl PeerStore {
         self.peers.contains_key(master_id)
     }
 
+    pub fn get(&self, master_id: &str) -> Option<&Peer> {
+        self.peers.get(master_id)
+    }
+
     pub fn add_and_save(&mut self, peer: Peer) -> Result<(), PeerStoreError> {
         self.peers.insert(peer.master_id.clone(), peer);
         self.save()
@@ -97,11 +106,34 @@ impl PeerStore {
         };
         let json =
             serde_json::to_string_pretty(&file).expect("PeersFile serialization cannot fail");
-        fs::write(&self.path, json).map_err(|source| PeerStoreError::Write {
+        write_owner_only(&self.path, &json).map_err(|source| PeerStoreError::Write {
             path: self.path.clone(),
             source,
         })
     }
+}
+
+/// Writes `contents` with owner-only permissions set at creation time
+/// rather than written-then-chmod'd — this file holds reconnect tokens,
+/// which are bearer secrets. See `tls.rs::write_private_key` for the
+/// same pattern applied to the TLS private key.
+#[cfg(unix)]
+fn write_owner_only(path: &Path, contents: &str) -> std::io::Result<()> {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)?;
+    file.write_all(contents.as_bytes())
+}
+
+#[cfg(not(unix))]
+fn write_owner_only(path: &Path, contents: &str) -> std::io::Result<()> {
+    std::fs::write(path, contents)
 }
 
 /// After this many failed `PairConfirm` attempts on a single connection,
@@ -162,21 +194,37 @@ impl PairingSession {
         self.status == PairingStatus::Locked
     }
 
-    /// Marks this connection paired without the challenge/confirm dance,
-    /// for a `PairRequest` whose `master_id` the caller has already
-    /// verified against [`PeerStore`] (persistent trust from a previous
-    /// pairing). Pairing state lives per-connection, not per-identity —
-    /// every new connection needs *a* `PairRequest`, but a known Master
-    /// shouldn't need a fresh human-confirmed code every time it
-    /// reconnects to submit a job.
-    pub fn accept_as_already_paired(&mut self) -> Message {
+    /// Marks this connection paired without the challenge/confirm dance.
+    /// The caller must have already verified, against [`PeerStore`], that
+    /// the `reconnect_token` presented on this connection's `PairRequest`
+    /// matches the one on record for `master_id` — `master_id` alone is a
+    /// bare, non-secret identifier and must never be treated as proof of
+    /// identity by itself (that was a real auth-bypass vulnerability in
+    /// an earlier version of this method). Returns a freshly rotated
+    /// token the caller must persist via [`PeerStore::add_and_save`],
+    /// invalidating the one that was just used.
+    pub fn accept_as_already_paired(
+        &mut self,
+        master_id: &str,
+        master_name: &str,
+    ) -> (Message, Peer) {
         self.status = PairingStatus::Paired;
-        Message::PairAccepted {
-            worker_id: self.worker_id.clone(),
-            worker_name: self.worker_name.clone(),
-            os: self.os.clone(),
-            arch: self.arch.clone(),
-        }
+        let token = generate_reconnect_token();
+        let peer = Peer {
+            master_id: master_id.to_string(),
+            master_name: master_name.to_string(),
+            reconnect_token: token.clone(),
+        };
+        (
+            Message::PairAccepted {
+                worker_id: self.worker_id.clone(),
+                worker_name: self.worker_name.clone(),
+                os: self.os.clone(),
+                arch: self.arch.clone(),
+                reconnect_token: token,
+            },
+            peer,
+        )
     }
 
     /// Handles one incoming [`Message`], returning the reply to send back
@@ -189,6 +237,7 @@ impl PairingSession {
                 Message::PairRequest {
                     master_name,
                     master_id,
+                    ..
                 },
             ) => {
                 let code = generate_code();
@@ -218,9 +267,11 @@ impl PairingSession {
                         .pending_master
                         .clone()
                         .expect("pending_master is set alongside expected_code");
+                    let token = generate_reconnect_token();
                     let peer = Peer {
                         master_id,
                         master_name,
+                        reconnect_token: token.clone(),
                     };
                     (
                         Some(Message::PairAccepted {
@@ -228,6 +279,7 @@ impl PairingSession {
                             worker_name: self.worker_name.clone(),
                             os: self.os.clone(),
                             arch: self.arch.clone(),
+                            reconnect_token: token,
                         }),
                         Some(peer),
                     )
@@ -287,6 +339,18 @@ fn generate_code() -> String {
     format!("{:06}", rand::random_range(0..1_000_000u32))
 }
 
+/// A 256-bit bearer secret, hex-encoded. Generated fresh on every
+/// successful pairing (including silent reconnects) and never logged.
+fn generate_reconnect_token() -> String {
+    format!(
+        "{:016x}{:016x}{:016x}{:016x}",
+        rand::random::<u64>(),
+        rand::random::<u64>(),
+        rand::random::<u64>(),
+        rand::random::<u64>()
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -295,27 +359,32 @@ mod tests {
         Message::PairRequest {
             master_name: "MacBook-Pro".to_string(),
             master_id: "master-abc123".to_string(),
+            reconnect_token: None,
         }
     }
 
     #[test]
-    fn accept_as_already_paired_transitions_straight_to_paired() {
+    fn accept_as_already_paired_transitions_straight_to_paired_and_rotates_the_token() {
         let mut session = PairingSession::new("worker-1", "Threadripper-Box", "linux", "x86_64");
         assert!(!session.is_paired());
 
-        let reply = session.accept_as_already_paired();
+        let (reply, peer) = session.accept_as_already_paired("master-abc123", "MacBook-Pro");
         assert!(session.is_paired());
+        assert_eq!(peer.master_id, "master-abc123");
+        assert_eq!(peer.reconnect_token.len(), 64);
         match reply {
             Message::PairAccepted {
                 worker_id,
                 worker_name,
                 os,
                 arch,
+                reconnect_token,
             } => {
                 assert_eq!(worker_id, "worker-1");
                 assert_eq!(worker_name, "Threadripper-Box");
                 assert_eq!(os, "linux");
                 assert_eq!(arch, "x86_64");
+                assert_eq!(reconnect_token, peer.reconnect_token);
             }
             other => panic!("expected PairAccepted, got {other:?}"),
         }
@@ -330,7 +399,7 @@ mod tests {
     }
 
     #[test]
-    fn successful_pairing_roundtrip() {
+    fn successful_pairing_roundtrip_hands_out_a_reconnect_token() {
         let mut session = PairingSession::new("worker-1", "Threadripper-Box", "linux", "x86_64");
 
         let (reply, peer) = session.handle(&pair_request());
@@ -350,17 +419,20 @@ mod tests {
         let peer = peer.expect("pairing should produce a Peer to persist");
         assert_eq!(peer.master_id, "master-abc123");
         assert_eq!(peer.master_name, "MacBook-Pro");
+        assert_eq!(peer.reconnect_token.len(), 64);
         match reply {
             Some(Message::PairAccepted {
                 worker_id,
                 worker_name,
                 os,
                 arch,
+                reconnect_token,
             }) => {
                 assert_eq!(worker_id, "worker-1");
                 assert_eq!(worker_name, "Threadripper-Box");
                 assert_eq!(os, "linux");
                 assert_eq!(arch, "x86_64");
+                assert_eq!(reconnect_token, peer.reconnect_token);
             }
             other => panic!("expected PairAccepted, got {other:?}"),
         }
@@ -470,11 +542,39 @@ mod tests {
             .add_and_save(Peer {
                 master_id: "master-abc123".to_string(),
                 master_name: "MacBook-Pro".to_string(),
+                reconnect_token: "a".repeat(64),
             })
             .expect("add_and_save");
         assert!(store.is_paired("master-abc123"));
 
         let reloaded = PeerStore::load(&path).expect("reload store");
         assert!(reloaded.is_paired("master-abc123"));
+        assert_eq!(
+            reloaded.get("master-abc123").unwrap().reconnect_token,
+            "a".repeat(64)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn peers_file_is_restricted_to_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("peers.json");
+        let mut store = PeerStore::load(&path).expect("load empty store");
+        store
+            .add_and_save(Peer {
+                master_id: "master-abc123".to_string(),
+                master_name: "MacBook-Pro".to_string(),
+                reconnect_token: "a".repeat(64),
+            })
+            .expect("add_and_save");
+
+        let mode = std::fs::metadata(&path)
+            .expect("metadata")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
     }
 }

@@ -7,10 +7,26 @@ fn roundtrip(msg: &Message) -> Message {
 }
 
 #[test]
-fn pair_request_roundtrips() {
+fn pair_request_roundtrips_without_reconnect_token() {
     let msg = Message::PairRequest {
         master_name: "MacBook-Pro".into(),
         master_id: "master-abc123".into(),
+        reconnect_token: None,
+    };
+    let json = serde_json::to_string(&msg).expect("serialize");
+    assert!(
+        !json.contains("reconnect_token"),
+        "reconnect_token should be omitted when None"
+    );
+    assert_eq!(roundtrip(&msg), msg);
+}
+
+#[test]
+fn pair_request_roundtrips_with_reconnect_token() {
+    let msg = Message::PairRequest {
+        master_name: "MacBook-Pro".into(),
+        master_id: "master-abc123".into(),
+        reconnect_token: Some("a".repeat(64)),
     };
     assert_eq!(roundtrip(&msg), msg);
 }
@@ -80,6 +96,7 @@ fn pair_accepted_roundtrips() {
         worker_name: "Threadripper-Box".into(),
         os: "linux".into(),
         arch: "x86_64".into(),
+        reconnect_token: "b".repeat(64),
     };
     assert_eq!(roundtrip(&msg), msg);
 }

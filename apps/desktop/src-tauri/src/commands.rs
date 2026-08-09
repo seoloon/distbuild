@@ -160,9 +160,24 @@ pub async fn submit_job(
         .cloned()
         .ok_or_else(|| "worker is not paired".to_string())?;
 
-    let stream = ws_client::resume_paired_connection(&peer, &state.master_name, &state.master_id)
-        .await
-        .map_err(|e| e.to_string())?;
+    let (stream, rotated_token) =
+        ws_client::resume_paired_connection(&peer, &state.master_name, &state.master_id)
+            .await
+            .map_err(|e| e.to_string())?;
+
+    // The token just used is now invalid — persist the one the worker
+    // rotated in so the *next* reconnect doesn't fall back to a full
+    // interactive re-pair.
+    {
+        let mut rotated_peer = peer.clone();
+        rotated_peer.reconnect_token = rotated_token;
+        state
+            .peer_store
+            .lock()
+            .await
+            .add_and_save(rotated_peer)
+            .map_err(|e| e.to_string())?;
+    }
 
     let job_id = format!("job-{:016x}", rand::random::<u64>());
     let cancel = CancellationToken::new();
