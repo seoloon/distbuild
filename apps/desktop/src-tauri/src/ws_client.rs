@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use futures_util::{SinkExt, StreamExt};
@@ -8,6 +9,7 @@ use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tokio_tungstenite::{
     connect_async_tls_with_config, Connector, MaybeTlsStream, WebSocketStream,
 };
+use tokio_util::sync::CancellationToken;
 
 use crate::peers::MasterPeer;
 use crate::tls_verify::{provider, PinnedVerifier, TofuVerifier};
@@ -161,4 +163,172 @@ pub async fn confirm_pairing(
 pub async fn connect_paired(peer: &MasterPeer) -> Result<WsStream, WsClientError> {
     let verifier = PinnedVerifier::new(provider(), peer.fingerprint);
     connect_with_verifier(&peer.host, peer.port, verifier).await
+}
+
+/// Opens a pinned connection to an already-paired worker and completes
+/// the pairing handshake on it. Pairing state lives per-connection on the
+/// worker, not per-identity, so every new connection needs *a*
+/// `PairRequest` — but since the worker recognizes this `master_id` from
+/// a previous pairing, it accepts immediately without a fresh
+/// human-confirmed code (see `worker_core::pairing::PairingSession::accept_as_already_paired`).
+/// Returns a stream ready for `JobRequest`/`JobCancel`.
+pub async fn resume_paired_connection(
+    peer: &MasterPeer,
+    master_name: &str,
+    master_id: &str,
+) -> Result<WsStream, WsClientError> {
+    let mut stream = connect_paired(peer).await?;
+    send(
+        &mut stream,
+        &Message::PairRequest {
+            master_name: master_name.to_string(),
+            master_id: master_id.to_string(),
+        },
+    )
+    .await?;
+
+    let reply = recv_message(&mut stream).await?;
+    match reply {
+        Message::PairAccepted { .. } => Ok(stream),
+        Message::Error { code, message } => Err(WsClientError::Rejected { code, message }),
+        other => Err(WsClientError::UnexpectedReply(other)),
+    }
+}
+
+pub struct JobRequestArgs {
+    pub job_id: String,
+    pub repo: String,
+    pub branch: String,
+    pub profile: String,
+}
+
+/// Where `run_job_stream` forwards protocol updates for the frontend to
+/// observe. Kept independent of `tauri::AppHandle` so the job-streaming
+/// logic can be exercised in tests without spinning up a Tauri runtime
+/// (constructing a real `AppHandle`, even `tauri::test`'s mock one,
+/// pulls in native webview runtime initialization that has no bearing on
+/// this function's actual logic).
+pub trait JobEventSink: Send + 'static {
+    fn emit(&self, event: &str, message: &Message);
+}
+
+impl<R: tauri::Runtime> JobEventSink for tauri::AppHandle<R> {
+    fn emit(&self, event: &str, message: &Message) {
+        let _ = tauri::Emitter::emit(self, event, message);
+    }
+}
+
+/// Sends `JobRequest` on an already-connected, pinned socket, then relays
+/// every reply to `sink` as an event (`job://log`, `job://progress`,
+/// `job://artifact`, `job://finished`) until the job finishes or the
+/// connection drops. Binary chunk frames (framed per
+/// `worker_core::jobs`'s doc comment: `[u32 LE header_len][header
+/// JSON][chunk bytes]`) are reassembled and written to
+/// `<artifacts_dir>/<job_id>/<filename>` once the last chunk arrives.
+///
+/// `cancel` is watched cooperatively: once cancelled, a single
+/// `JobCancel` is sent and this function keeps reading until the worker
+/// reports `JobFinished` (with `success: false`) or the connection ends.
+pub async fn run_job_stream<S: JobEventSink>(
+    mut stream: WsStream,
+    job: JobRequestArgs,
+    sink: S,
+    artifacts_dir: PathBuf,
+    cancel: CancellationToken,
+) -> Result<(), WsClientError> {
+    let job_id = job.job_id.clone();
+
+    send(
+        &mut stream,
+        &Message::JobRequest {
+            job_id: job.job_id.clone(),
+            repo: job.repo,
+            branch: job.branch,
+            profile: job.profile,
+            env: None,
+            distbuild_toml: None,
+        },
+    )
+    .await?;
+
+    let mut chunks: Vec<(u32, Vec<u8>)> = Vec::new();
+    let mut artifact_filename: Option<String> = None;
+    let mut cancel_sent = false;
+
+    loop {
+        let frame = if cancel_sent {
+            stream.next().await
+        } else {
+            tokio::select! {
+                _ = cancel.cancelled() => {
+                    let _ = send(&mut stream, &Message::JobCancel { job_id: job_id.clone() }).await;
+                    cancel_sent = true;
+                    continue;
+                }
+                frame = stream.next() => frame,
+            }
+        };
+
+        let Some(frame) = frame else { break };
+        let frame = frame.map_err(|source| WsClientError::Connect {
+            host: String::new(),
+            port: 0,
+            source,
+        })?;
+
+        match frame {
+            WsMessage::Text(text) => {
+                let message: Message = match serde_json::from_str(&text) {
+                    Ok(message) => message,
+                    Err(_) => continue,
+                };
+                match &message {
+                    Message::LogChunk { .. } => {
+                        sink.emit("job://log", &message);
+                    }
+                    Message::JobProgress { .. } => {
+                        sink.emit("job://progress", &message);
+                    }
+                    Message::ArtifactReady { filename, .. } => {
+                        artifact_filename = Some(filename.clone());
+                        sink.emit("job://artifact", &message);
+                    }
+                    Message::JobFinished { .. } => {
+                        sink.emit("job://finished", &message);
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            WsMessage::Binary(data) => {
+                if data.len() < 4 {
+                    continue;
+                }
+                let header_len = u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
+                if data.len() < 4 + header_len {
+                    continue;
+                }
+                let Ok(header) =
+                    serde_json::from_slice::<artifacts::ChunkHeader>(&data[4..4 + header_len])
+                else {
+                    continue;
+                };
+                chunks.push((header.chunk_index, data[4 + header_len..].to_vec()));
+            }
+            _ => {}
+        }
+    }
+
+    if let Some(filename) = artifact_filename {
+        if !chunks.is_empty() {
+            chunks.sort_by_key(|(index, _)| *index);
+            let reassembled: Vec<u8> = chunks.into_iter().flat_map(|(_, bytes)| bytes).collect();
+            let job_dir = artifacts_dir.join(&job_id);
+            if std::fs::create_dir_all(&job_dir).is_ok() {
+                let _ = std::fs::write(job_dir.join(&filename), &reassembled);
+            }
+        }
+    }
+
+    Ok(())
 }

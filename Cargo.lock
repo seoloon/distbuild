@@ -1004,11 +1004,16 @@ dependencies = [
 name = "desktop"
 version = "0.1.0"
 dependencies = [
+ "artifacts",
  "axum",
  "axum-server",
+ "dirs",
+ "discovery",
  "futures-util",
+ "git2",
  "hex",
  "protocol",
+ "rand 0.10.2",
  "rcgen",
  "rustls",
  "rustls-pki-types",
@@ -1022,6 +1027,8 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "tokio-tungstenite 0.30.0",
+ "tokio-util",
+ "ts-rs",
  "worker-core",
 ]
 
@@ -4650,6 +4657,7 @@ dependencies = [
  "bytes",
  "futures-core",
  "futures-sink",
+ "futures-util",
  "libc",
  "pin-project-lite",
  "tokio",

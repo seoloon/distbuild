@@ -22,19 +22,26 @@ tauri = { version = "2", features = [] }
 tauri-plugin-opener = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+artifacts = { version = "0.1.0", path = "../../../crates/artifacts" }
+discovery = { version = "0.1.0", path = "../../../crates/discovery" }
+dirs = "6.0.0"
 futures-util = "0.3.33"
 hex = "0.4.3"
 protocol = { version = "0.1.0", path = "../../../crates/protocol" }
+rand = "0.10.2"
 rustls = "0.23"
 rustls-pki-types = "1"
 sha2.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+ts-rs = "12.0.1"
 
 [dev-dependencies]
 axum = { version = "0.8.9", features = ["ws"] }
 axum-server = { version = "0.8.0", features = ["tls-rustls"] }
+git2 = "0.20"
 rcgen = "0.14.8"
 tempfile = "3.27.0"
 worker-core = { version = "0.1.0", path = "../../worker-core" }

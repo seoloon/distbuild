@@ -80,6 +80,21 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
                     }
                 };
 
+                if !session.is_paired() {
+                    if let protocol::Message::PairRequest { master_id, .. } = &incoming {
+                        let already_known = state.peer_store.lock().await.is_paired(master_id);
+                        if already_known {
+                            let reply = session.accept_as_already_paired();
+                            let json = serde_json::to_string(&reply)
+                                .expect("Message serialization cannot fail");
+                            if socket.send(WsMessage::Text(json.into())).await.is_err() {
+                                break;
+                            }
+                            continue;
+                        }
+                    }
+                }
+
                 if session.is_paired() {
                     match &incoming {
                         protocol::Message::JobRequest { job_id, repo, branch, profile, .. } => {

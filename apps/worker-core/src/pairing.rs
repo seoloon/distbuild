@@ -162,6 +162,23 @@ impl PairingSession {
         self.status == PairingStatus::Locked
     }
 
+    /// Marks this connection paired without the challenge/confirm dance,
+    /// for a `PairRequest` whose `master_id` the caller has already
+    /// verified against [`PeerStore`] (persistent trust from a previous
+    /// pairing). Pairing state lives per-connection, not per-identity —
+    /// every new connection needs *a* `PairRequest`, but a known Master
+    /// shouldn't need a fresh human-confirmed code every time it
+    /// reconnects to submit a job.
+    pub fn accept_as_already_paired(&mut self) -> Message {
+        self.status = PairingStatus::Paired;
+        Message::PairAccepted {
+            worker_id: self.worker_id.clone(),
+            worker_name: self.worker_name.clone(),
+            os: self.os.clone(),
+            arch: self.arch.clone(),
+        }
+    }
+
     /// Handles one incoming [`Message`], returning the reply to send back
     /// (if any) and, on newly-completed pairing, the [`Peer`] the caller
     /// should persist via [`PeerStore::add_and_save`].
@@ -278,6 +295,37 @@ mod tests {
         Message::PairRequest {
             master_name: "MacBook-Pro".to_string(),
             master_id: "master-abc123".to_string(),
+        }
+    }
+
+    #[test]
+    fn accept_as_already_paired_transitions_straight_to_paired() {
+        let mut session = PairingSession::new("worker-1", "Threadripper-Box", "linux", "x86_64");
+        assert!(!session.is_paired());
+
+        let reply = session.accept_as_already_paired();
+        assert!(session.is_paired());
+        match reply {
+            Message::PairAccepted {
+                worker_id,
+                worker_name,
+                os,
+                arch,
+            } => {
+                assert_eq!(worker_id, "worker-1");
+                assert_eq!(worker_name, "Threadripper-Box");
+                assert_eq!(os, "linux");
+                assert_eq!(arch, "x86_64");
+            }
+            other => panic!("expected PairAccepted, got {other:?}"),
+        }
+
+        // Subsequent JobRequest-style traffic is now accepted, matching
+        // the normal post-pairing behavior.
+        let (reply, _) = session.handle(&pair_request());
+        match reply {
+            Some(Message::Error { code, .. }) => assert_eq!(code, "ALREADY_PAIRED"),
+            other => panic!("expected Error, got {other:?}"),
         }
     }
 
